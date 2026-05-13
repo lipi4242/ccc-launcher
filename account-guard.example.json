@@ -1,0 +1,24 @@
+{
+  "default_account": "personal",
+  "accounts": {
+    "personal": {
+      "email": "you@example.com",
+      "config_dir": "~/.claude-personal",
+      "description": "Personal — catch-all for everything not matched by repo_rules"
+    },
+    "work": {
+      "email": "you@work.example",
+      "config_dir": "~/.claude-work",
+      "description": "Rename this to your workspace (e.g. \"acme\"); add more accounts below the same way"
+    },
+    "testcase": {
+      "email": null,
+      "config_dir": null,
+      "description": "Optional: API-key path via direnv (no OAuth). Skip if you don't need it."
+    }
+  },
+  "repo_rules": [
+    { "match": "testcases/", "account": "testcase" },
+    { "match": "work-project-name", "account": "work" }
+  ]
+}
