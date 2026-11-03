@@ -33,6 +33,9 @@ cat > "$MOCK_BIN/claude" << 'MOCK'
 #!/bin/bash
 # Log invocation
 echo "$@" >> "${CCC_TEST_ARGLOG:-/dev/null}"
+# Simulate a hung CLI for the auth-timeout test
+if [[ "$*" == *"auth status"* ]] && [ -n "${CCC_TEST_AUTH_SLEEP:-}" ]; then sleep "$CCC_TEST_AUTH_SLEEP"; fi
+if [ "${1:-}" = "--version" ]; then echo "9.9.9 (Claude Code)"; exit 0; fi
 if [ -n "${CCC_TEST_ENVLOG:-}" ]; then
   {
     echo "CLAUDE_CONFIG_DIR=${CLAUDE_CONFIG_DIR:-}"
@@ -48,7 +51,7 @@ if [[ "$*" == *"auth status"* ]] && [[ "$*" == *"--json"* ]]; then
   if [ "${CCC_TEST_LOGGED_OUT:-}" = "1" ]; then
     echo '{"loggedIn":false}'
   else
-    echo "{\"email\":\"${CCC_TEST_AUTH_EMAIL:-test@personal.com}\"}"
+    echo "{\"email\":\"${CCC_TEST_AUTH_EMAIL-test@personal.com}\"}"
   fi
   exit 0
 fi
@@ -697,6 +700,72 @@ for CMD in python3 git; do
     fail "$CMD available" "not in PATH"
   fi
 done
+
+
+# ============================================================
+# Stability: no silent exits, helpers, doctor
+# ============================================================
+echo ""
+echo "--- Stability ---"
+
+for f in route.py auth_email.py setup.sh doctor.sh; do
+  if [ -f "$TEST_DIR/../lib/$f" ]; then pass "lib/$f present"; else fail "lib/$f present" "missing"; fi
+done
+
+# Reached through a symlink (how ~/.local/bin/ccc works) the helpers are still found
+ln -sf "$CCC" "$TMPDIR_BASE/ccc-link"
+OUTPUT=$(cd "$TMPDIR_BASE/repos/my-project" && CCC_TEST_AUTH_EMAIL="test@personal.com" PATH="$MOCK_BIN:$PATH" HOME="$TMPDIR_BASE" bash "$TMPDIR_BASE/ccc-link" --status 2>&1 || true)
+if echo "$OUTPUT" | grep -q "personal" && ! echo "$OUTPUT" | grep -q "unbound"; then
+  pass "Works when called through a symlink"
+else
+  fail "Works when called through a symlink" "$OUTPUT"
+fi
+
+# Not logged in → clear message, and no 'stopped unexpectedly' noise
+OUTPUT=$(cd "$TMPDIR_BASE/repos/my-project" && CCC_TEST_AUTH_EMAIL="" PATH="$MOCK_BIN:$PATH" HOME="$TMPDIR_BASE" bash "$CCC" 2>&1 || true)
+if echo "$OUTPUT" | grep -q "Not logged into" && ! echo "$OUTPUT" | grep -q "unexpectedly"; then
+  pass "Not logged in: clear message, no trap noise"
+else
+  fail "Not logged in: clear message" "$OUTPUT"
+fi
+
+# Hung `claude auth status` → times out with a message instead of freezing
+START=$(date +%s)
+OUTPUT=$(CCC_TEST_AUTH_SLEEP=5 CCC_AUTH_TIMEOUT=1 run_ccc my-project || true)
+ELAPSED=$(( $(date +%s) - START ))
+if echo "$OUTPUT" | grep -q "did not answer" && [ "$ELAPSED" -lt 5 ]; then
+  pass "Hung auth check times out with a message (${ELAPSED}s)"
+else
+  fail "Hung auth check times out" "elapsed=${ELAPSED}s out=$OUTPUT"
+fi
+
+# claude missing from PATH → says so
+OUTPUT=$(cd "$TMPDIR_BASE/repos/my-project" && PATH="/usr/bin:/bin" HOME="$TMPDIR_BASE" bash "$CCC" 2>&1 || true)
+if echo "$OUTPUT" | grep -q "not on PATH"; then
+  pass "Missing claude binary is reported"
+else
+  fail "Missing claude binary is reported" "$OUTPUT"
+fi
+
+# Unexpected failure → the ERR trap names the line instead of exiting silently
+if grep -q "trap .*stopped unexpectedly.*ERR" "$CCC" && grep -q "^set -E" "$CCC"; then
+  pass "ERR trap reports unexpected failures"
+else
+  fail "ERR trap reports unexpected failures" "trap or set -E missing"
+fi
+
+# --doctor: valid config + matching login → per-account report
+OUTPUT=$(CCC_TEST_AUTH_EMAIL="test@personal.com" run_ccc my-project --doctor || true)
+if echo "$OUTPUT" | grep -q "Account personal" && echo "$OUTPUT" | grep -q "Account work" && echo "$OUTPUT" | grep -q "Config is valid"; then
+  pass "--doctor reports config and every account"
+else
+  fail "--doctor reports config and every account" "$OUTPUT"
+fi
+if echo "$OUTPUT" | grep -q "logged in as test@personal.com, expected test@work.example"; then
+  pass "--doctor flags a login on the wrong email"
+else
+  fail "--doctor flags a login on the wrong email" "$OUTPUT"
+fi
 
 # --- Summary ---
 echo ""

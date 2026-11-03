@@ -142,6 +142,7 @@ against the right config dir. Each account needs this once.
 cd ~/code/some-repo
 ccc                       # picks the right account, launches claude
 ccc --status              # show which account this repo maps to
+ccc --doctor              # check logins, config and that the launcher is pushed
 ccc --resume <session>    # pass through to claude
 ccc /your:slash-command   # passes a slash command as the prompt
 ccc --telegram            # adds the Telegram channel plugin

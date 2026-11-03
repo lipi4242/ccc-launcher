@@ -11,6 +11,7 @@
 #   ccc --force        Launch even if the logged-in email doesn't match
 #   ccc --status       Show the account mapping for this repo
 #   ccc --setup        Interactive login for every account in the config
+#   ccc --doctor       Check config, every login, and that ccc itself is pushed
 #   ccc [any args]     Passed through to claude (--resume, -c, a prompt, …)
 #
 # Config: ~/.claude/account-guard.json
@@ -38,6 +39,19 @@ GREEN='\033[0;32m'
 GOLD='\033[0;33m'
 DIM='\033[0;90m'
 NC='\033[0m'
+
+# Resolve the real script dir (ccc is usually reached through a symlink in
+# ~/.local/bin) so the helpers in lib/ are found.
+CCC_LIB="$(dirname "$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "${BASH_SOURCE[0]}")")/lib"
+
+# Never exit silently: if any command fails unexpectedly, say where.
+set -E
+trap 'echo -e "${RED}✗ ccc stopped unexpectedly (line $LINENO): $BASH_COMMAND${NC}" >&2; echo "  Run: ccc --doctor" >&2' ERR
+
+if ! command -v claude >/dev/null 2>&1; then
+  echo -e "${RED}✗${NC} The 'claude' command is not on PATH. Install Claude Code first."
+  exit 1
+fi
 
 # --- Handle ccc's own flags; everything else is passed through to claude ---
 ARGS=()
@@ -98,56 +112,14 @@ if [ ! -f "$GUARD_CONFIG" ]; then
   exit 1
 fi
 
-# --- Setup mode ---
+# --- Setup / doctor modes ---
 if [ "${1:-}" = "--setup" ]; then
-  echo -e "${GOLD}Claude Code Multi-Account Setup${NC}"
-  echo ""
-  echo "This will log you into each account in its own config dir."
-  echo "You only need to do this once per account."
-  echo ""
-
-  # Collect the list first. Looping directly over a pipe would make the
-  # `read` prompts below consume the pipe instead of the terminal.
-  ACCOUNT_LIST=$(CCC_GUARD="$GUARD_CONFIG" python3 - <<'PY'
-import json, os
-cfg = json.load(open(os.environ['CCC_GUARD']))
-for name, acct in cfg.get('accounts', {}).items():
-    email = acct.get('email')
-    cd = acct.get('config_dir') or ''
-    if not email or not cd:
-        continue
-    print('%s|%s|%s' % (name, email, os.path.expanduser(cd)))
-PY
-)
-
-  while IFS='|' read -r name email cd; do
-    [ -n "$name" ] || continue
-    echo -e "${GOLD}→ $name ($email)${NC}"
-    echo "    Config dir: $cd"
-    mkdir -p "$cd"
-
-    read -r -p "    Claude: press Enter to login (or 's' to skip): " choice < /dev/tty
-    if [ "$choice" != "s" ]; then
-      CLAUDE_CONFIG_DIR="$cd" claude auth login --email "$email" || true
-    fi
-
-    if command -v gh >/dev/null 2>&1; then
-      read -r -p "    GitHub: press Enter to also run 'gh auth login' (or 's' to skip): " ghchoice < /dev/tty
-      if [ "$ghchoice" != "s" ]; then
-        mkdir -p "$cd/gh"
-        ensure_account_gitconfig "$cd"
-        GH_CONFIG_DIR="$cd/gh" gh auth login || true
-        GH_CONFIG_DIR="$cd/gh" GIT_CONFIG_GLOBAL="$cd/gitconfig" gh auth setup-git || true
-      fi
-    else
-      echo "    (gh CLI not installed — skipping GitHub login. Install: brew install gh)"
-    fi
-    echo ""
-  done <<< "$ACCOUNT_LIST"
-
-  echo -e "${GREEN}Setup complete!${NC} Use 'ccc' to launch Claude Code."
-  echo "Each tmux pane can run a different account simultaneously."
-  exit 0
+  # shellcheck source=lib/setup.sh
+  source "$CCC_LIB/setup.sh"
+fi
+if [ "${1:-}" = "--doctor" ]; then
+  # shellcheck source=lib/doctor.sh
+  source "$CCC_LIB/doctor.sh"
 fi
 
 # --- Detect repo ---
@@ -167,59 +139,7 @@ fi
 # git worktree resolves to the same account as its parent repo even when the
 # directory is named something else.
 ACCOUNT_INFO=$(
-  CCC_GUARD="$GUARD_CONFIG" CCC_CWD="$CWD" CCC_REMOTE="$REPO_REMOTE" python3 - <<'PY'
-import json, os, sys
-
-try:
-    cfg = json.load(open(os.environ['CCC_GUARD']))
-except Exception as exc:
-    sys.stderr.write("account-guard.json is not readable: %s\n" % exc)
-    sys.exit(1)
-
-cwd = os.environ['CCC_CWD']
-remote = os.environ.get('CCC_REMOTE', '')
-accounts = cfg.get('accounts', {})
-
-# Match remote rules against both the raw URL and a slash-normalised copy, so
-# one rule covers both remote forms:
-#   https://github.com/Org/repo.git   → matches "github.com/Org/" as written
-#   git@github.com:Org/repo.git       → matches it via the normalised copy
-remote_forms = [remote.lower(), remote.replace(':', '/').lower()] if remote else []
-
-
-def emit(status, name):
-    acct = accounts.get(name, {})
-    config_dir = acct.get('config_dir') or ''
-    if config_dir:
-        config_dir = os.path.expanduser(config_dir)
-    print('|'.join([status, name, acct.get('email') or '', config_dir,
-                    acct.get('description') or '']))
-
-
-for rule in cfg.get('repo_rules', []):
-    name = rule.get('account')
-    if name not in accounts:
-        sys.stderr.write("repo_rule points at unknown account %r\n" % name)
-        sys.exit(1)
-    if 'remote' in rule:
-        needle = rule['remote'].lower()
-        hit = any(needle in form for form in remote_forms)
-    elif 'match' in rule:
-        hit = rule['match'] in cwd
-    else:
-        sys.stderr.write("repo_rule needs a 'remote' or 'match' key: %r\n" % rule)
-        sys.exit(1)
-    if hit:
-        emit('rule', name)
-        sys.exit(0)
-
-fallback = cfg.get('default_account')
-if fallback and fallback in accounts:
-    emit('default', fallback)
-    sys.exit(0)
-
-print('none||||')
-PY
+  CCC_GUARD="$GUARD_CONFIG" CCC_CWD="$CWD" CCC_REMOTE="$REPO_REMOTE" python3 "$CCC_LIB/route.py"
 ) || {
   echo -e "${RED}✗${NC} Could not read $GUARD_CONFIG (see error above)."
   exit 1
@@ -243,9 +163,7 @@ if [ "${1:-}" = "--status" ]; then
   echo -e "${GOLD}Config:${NC}  $ACCT_CONFIG_DIR"
   echo -e "${GOLD}Desc:${NC}    $ACCT_DESC"
   if [ -n "$ACCT_CONFIG_DIR" ]; then
-    STATUS_EMAIL=$(CLAUDE_CONFIG_DIR="$ACCT_CONFIG_DIR" claude auth status --json 2>/dev/null \
-      | python3 -c "import sys,json; print(json.load(sys.stdin).get('email') or '')" 2>/dev/null \
-      || echo "")
+    STATUS_EMAIL=$(python3 "$CCC_LIB/auth_email.py" "$ACCT_CONFIG_DIR" 2>/dev/null || true)
     if [ -n "$STATUS_EMAIL" ]; then
       echo -e "${GOLD}Login:${NC}   $STATUS_EMAIL"
     else
@@ -268,9 +186,14 @@ if [ -z "$ACCT_CONFIG_DIR" ]; then
 fi
 
 # --- Check we're logged into the right account ---
-CURRENT_EMAIL=$(CLAUDE_CONFIG_DIR="$ACCT_CONFIG_DIR" claude auth status --json 2>/dev/null \
-  | python3 -c "import sys,json; print(json.load(sys.stdin).get('email') or '')" 2>/dev/null \
-  || echo "")
+AUTH_RC=0
+CURRENT_EMAIL=$(python3 "$CCC_LIB/auth_email.py" "$ACCT_CONFIG_DIR") || AUTH_RC=$?
+
+if [ "$AUTH_RC" -eq 3 ]; then
+  echo -e "${RED}✗${NC} Could not read the login state of the $ACCT_TYPE account (see above)."
+  echo "  Try: CLAUDE_CONFIG_DIR=$ACCT_CONFIG_DIR claude auth status"
+  exit 1
+fi
 
 if [ -z "$CURRENT_EMAIL" ]; then
   echo -e "${RED}✗${NC} Not logged into the $ACCT_TYPE account yet."
