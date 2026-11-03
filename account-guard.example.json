@@ -1,5 +1,6 @@
 {
   "default_account": "personal",
+
   "accounts": {
     "personal": {
       "email": "you@example.com",
@@ -9,16 +10,13 @@
     "work": {
       "email": "you@work.example",
       "config_dir": "~/.claude-work",
-      "description": "Rename this to your workspace (e.g. \"acme\"); add more accounts below the same way"
-    },
-    "testcase": {
-      "email": null,
-      "config_dir": null,
-      "description": "Optional: API-key path via direnv (no OAuth). Skip if you don't need it."
+      "description": "Rename this to your workspace (e.g. \"acme\"); add more accounts the same way"
     }
   },
+
   "repo_rules": [
-    { "match": "testcases/", "account": "testcase" },
-    { "match": "work-project-name", "account": "work" }
+    { "remote": "github.com/acme-org/", "account": "work" },
+    { "remote": "gitlab.com/acme/", "account": "work" },
+    { "match": "/acme-", "account": "work" }
   ]
 }

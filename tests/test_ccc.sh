@@ -33,25 +33,43 @@ cat > "$MOCK_BIN/claude" << 'MOCK'
 #!/bin/bash
 # Log invocation
 echo "$@" >> "${CCC_TEST_ARGLOG:-/dev/null}"
+if [ -n "${CCC_TEST_ENVLOG:-}" ]; then
+  {
+    echo "CLAUDE_CONFIG_DIR=${CLAUDE_CONFIG_DIR:-}"
+    echo "GH_CONFIG_DIR=${GH_CONFIG_DIR:-}"
+    echo "GIT_CONFIG_GLOBAL=${GIT_CONFIG_GLOBAL:-}"
+    echo "WRANGLER_HOME=${WRANGLER_HOME:-}"
+    echo "XDG_CONFIG_HOME=${XDG_CONFIG_HOME:-}"
+    echo "CLAUDE_CODE_AUTO_COMPACT_WINDOW=${CLAUDE_CODE_AUTO_COMPACT_WINDOW:-}"
+  } >> "$CCC_TEST_ENVLOG"
+fi
 # Handle auth status --json
 if [[ "$*" == *"auth status"* ]] && [[ "$*" == *"--json"* ]]; then
-  echo "{\"email\":\"${CCC_TEST_AUTH_EMAIL:-test@personal.com}\"}"
+  if [ "${CCC_TEST_LOGGED_OUT:-}" = "1" ]; then
+    echo '{"loggedIn":false}'
+  else
+    echo "{\"email\":\"${CCC_TEST_AUTH_EMAIL:-test@personal.com}\"}"
+  fi
   exit 0
 fi
 exit 0
 MOCK
 chmod +x "$MOCK_BIN/claude"
 
-# Mock git: returns configurable repo root
+# Mock git: repo root is the cwd; origin remote comes from a .mock-remote file
+# in the repo dir, so a "worktree" can carry a remote its path doesn't hint at.
 cat > "$MOCK_BIN/git" << 'MOCK'
 #!/bin/bash
 if [ "${1:-}" = "rev-parse" ] && [ "${2:-}" = "--show-toplevel" ]; then
   if [ "${CCC_TEST_NO_GIT:-}" = "1" ]; then
     exit 128
   fi
-  # Return the cwd as the repo root
   pwd
   exit 0
+fi
+if [ "${1:-}" = "remote" ] && [ "${2:-}" = "get-url" ]; then
+  if [ -f .mock-remote ]; then cat .mock-remote; exit 0; fi
+  exit 1
 fi
 /usr/bin/git "$@"
 MOCK
@@ -72,28 +90,30 @@ cat > "$TMPDIR_BASE/.claude/account-guard.json" << 'JSON'
       "email": "test@work.example",
       "config_dir": "~/.claude-work",
       "description": "Work account"
-    },
-    "testcase": {
-      "email": null,
-      "config_dir": null,
-      "description": "Testcase — direnv API key"
     }
   },
   "repo_rules": [
-    { "match": "testcases/", "account": "testcase" },
-    { "match": "my-project", "account": "personal" },
+    { "remote": "github.com/Work-Org/", "account": "work" },
     { "match": "work-repo", "account": "work" }
   ]
 }
 JSON
 
-# Create fake repo dirs (ccc matches against pwd)
+# Create fake repo dirs (ccc matches against pwd + origin remote)
 mkdir -p "$TMPDIR_BASE/repos/my-project"
 mkdir -p "$TMPDIR_BASE/repos/work-repo"
-mkdir -p "$TMPDIR_BASE/repos/testcases/hf-999"
 mkdir -p "$TMPDIR_BASE/repos/random-unknown"
+mkdir -p "$TMPDIR_BASE/repos/wt-alias"
+mkdir -p "$TMPDIR_BASE/repos/wt-shouty"
 mkdir -p "$TMPDIR_BASE/.claude-personal"
 mkdir -p "$TMPDIR_BASE/.claude-work"
+
+# A worktree whose directory name gives no hint — only the remote does.
+echo "https://github.com/Work-Org/thing.git" > "$TMPDIR_BASE/repos/wt-alias/.mock-remote"
+# Same, with different casing, to prove remote matching is case-insensitive.
+echo "git@github.com:WORK-ORG/other.git" > "$TMPDIR_BASE/repos/wt-shouty/.mock-remote"
+# A personal repo that does have a remote, just not a matching one.
+echo "https://github.com/me/my-project.git" > "$TMPDIR_BASE/repos/my-project/.mock-remote"
 
 # Helper: run ccc in a mock repo directory
 # Usage: run_ccc <repo_dir> [args...]
@@ -183,53 +203,48 @@ else
 fi
 
 # ============================================================
-# Section 4: Session config (single mode — always 1M Opus)
+# Section 4: The launcher must not pin session settings
 # ============================================================
 echo ""
-echo "--- Session config ---"
+echo "--- No session-setting overrides ---"
 
-# 4.1 Default banner shows 1M / Opus 4.7
-OUTPUT=$(run_ccc my-project --status)
-if echo "$OUTPUT" | grep -q "1M context · Opus 4.7"; then
-  pass "Banner shows '1M context · Opus 4.7'"
+# 4.1 No --model flag in executable code. `--model opus` would override the
+#     account's settings.json ("model": "opus[1m]") and silently drop the 1M
+#     context. Comments may mention it — that's the explanation of why it's gone.
+if grep -v '^\s*#' "$CCC" | grep -q -- '--model'; then
+  fail "Script never passes --model" "found a --model reference outside comments"
 else
-  fail "Banner shows '1M context · Opus 4.7'" "$(echo "$OUTPUT" | head -1)"
+  pass "Script never passes --model (settings.json owns the model)"
 fi
 
-# 4.2 No 200K / routine-mode artifacts in script
-if grep -q "ROUTINE MODE\|CLAUDE_CODE_DISABLE_1M_CONTEXT\|CLAUDE_CODE_EFFORT_LEVEL=medium" "$CCC"; then
-  fail "Routine-mode artifacts removed from script" "found legacy strings"
+# 4.2 No legacy mode / context / compaction env artifacts
+if grep -q "ROUTINE MODE\|CLAUDE_CODE_DISABLE_1M_CONTEXT\|CLAUDE_CODE_EFFORT_LEVEL\|CLAUDE_CODE_AUTO_COMPACT_WINDOW" "$CCC"; then
+  fail "Legacy session-config artifacts removed" "found legacy strings"
 else
-  pass "Routine-mode artifacts removed from script"
+  pass "Legacy session-config artifacts removed"
 fi
 
-# 4.3 --orch / --orchestrator silently accepted (no-op, doesn't break flow)
-OUTPUT=$(run_ccc my-project --orch --status)
-if echo "$OUTPUT" | grep -q "Repo:"; then
-  pass "--orch silently accepted (deprecated no-op)"
-else
-  fail "--orch silently accepted" "$(echo "$OUTPUT" | head -3)"
-fi
-OUTPUT=$(run_ccc my-project --orchestrator --status)
-if echo "$OUTPUT" | grep -q "Repo:"; then
-  pass "--orchestrator (long form) silently accepted"
-else
-  fail "--orchestrator silently accepted" "$(echo "$OUTPUT" | head -3)"
-fi
-
-# 4.4 --model opus included in EXTRA_FLAGS
-ARGLOG="$TMPDIR_BASE/arglog-model"
+# 4.3 Confirm at runtime that claude is invoked without --model
+ARGLOG_MODEL="$TMPDIR_BASE/arglog-model"
+ENVLOG_MODEL="$TMPDIR_BASE/envlog-model"
 (
   cd "$TMPDIR_BASE/repos/my-project"
-  CCC_TEST_ARGLOG="$ARGLOG" \
+  CCC_TEST_ARGLOG="$ARGLOG_MODEL" \
+  CCC_TEST_ENVLOG="$ENVLOG_MODEL" \
   CCC_TEST_AUTH_EMAIL="test@personal.com" \
   PATH="$MOCK_BIN:$PATH" HOME="$TMPDIR_BASE" \
   bash "$CCC" 2>&1 >/dev/null
 ) || true
-if grep -q -- "--model opus" "$ARGLOG" 2>/dev/null; then
-  pass "claude invoked with --model opus"
+LAUNCH_ARGS=$(grep -v 'auth status' "$ARGLOG_MODEL" 2>/dev/null || echo "")
+if ! echo "$LAUNCH_ARGS" | grep -q -- '--model'; then
+  pass "claude launched without --model"
 else
-  fail "claude invoked with --model opus" "args: $(cat $ARGLOG 2>/dev/null)"
+  fail "claude launched without --model" "args: $LAUNCH_ARGS"
+fi
+if grep -q "^CLAUDE_CODE_AUTO_COMPACT_WINDOW=$" "$ENVLOG_MODEL" 2>/dev/null; then
+  pass "CLAUDE_CODE_AUTO_COMPACT_WINDOW not exported"
+else
+  fail "CLAUDE_CODE_AUTO_COMPACT_WINDOW not exported" "env: $(cat "$ENVLOG_MODEL" 2>/dev/null)"
 fi
 
 # ============================================================
@@ -238,7 +253,7 @@ fi
 echo ""
 echo "--- --status output ---"
 OUTPUT=$(run_ccc my-project --status)
-for FIELD in "Repo:" "Account:" "Config:" "Desc:"; do
+for FIELD in "Repo:" "Remote:" "Account:" "Config:" "Desc:" "Login:"; do
   if echo "$OUTPUT" | grep -q "$FIELD"; then
     pass "--status includes $FIELD"
   else
@@ -252,63 +267,54 @@ done
 echo ""
 echo "--- Account resolution ---"
 
-# 6.1 Personal repo
-OUTPUT=$(run_ccc my-project --status)
-if echo "$OUTPUT" | grep -q "personal"; then
-  pass "my-project → personal account"
-else
-  fail "my-project → personal account" "$OUTPUT"
-fi
-
-# 6.2 Work repo
+# 6.1 Path-rule match
 OUTPUT=$(CCC_TEST_AUTH_EMAIL="test@work.example" run_ccc work-repo --status)
-if echo "$OUTPUT" | grep -q "work"; then
-  pass "work-repo → work account"
+if echo "$OUTPUT" | grep -q "Account:.*work.*via rule"; then
+  pass "work-repo → work account via path rule"
 else
-  fail "work-repo → work account" "$OUTPUT"
+  fail "work-repo → work account via path rule" "$OUTPUT"
 fi
 
-# 6.3 Unknown repo resolves as unknown in --status
-OUTPUT=$(run_ccc random-unknown --status)
-if echo "$OUTPUT" | grep -q "Account:.*unknown"; then
-  pass "Unknown repo shows 'unknown' in --status"
+# 6.2 Remote-rule match wins even when the directory name says nothing
+OUTPUT=$(CCC_TEST_AUTH_EMAIL="test@work.example" run_ccc wt-alias --status)
+if echo "$OUTPUT" | grep -q "Account:.*work.*via rule"; then
+  pass "Worktree with Work-Org remote → work account via remote rule"
 else
-  fail "Unknown repo shows 'unknown' in --status" "$OUTPUT"
+  fail "Worktree with Work-Org remote → work account" "$OUTPUT"
 fi
 
-# 6.4 Unknown repo shows warning on normal launch (not --status)
+# 6.3 Remote matching is case-insensitive
+OUTPUT=$(CCC_TEST_AUTH_EMAIL="test@work.example" run_ccc wt-shouty --status)
+if echo "$OUTPUT" | grep -q "Account:.*work.*via rule"; then
+  pass "Remote rule matches case-insensitively (WORK-ORG)"
+else
+  fail "Remote rule matches case-insensitively" "$OUTPUT"
+fi
+
+# 6.4 Non-matching remote does not accidentally route to work
+OUTPUT=$(run_ccc my-project --status)
+if echo "$OUTPUT" | grep -q "Account:.*personal.*via default"; then
+  pass "Repo with an unrelated remote → default account"
+else
+  fail "Repo with an unrelated remote → default account" "$OUTPUT"
+fi
+
+# 6.5 Unmatched repo falls through to default_account, quietly but visibly
 OUTPUT=$(run_ccc random-unknown 2>&1 || true)
+if echo "$OUTPUT" | grep -q "random-unknown → personal" && echo "$OUTPUT" | grep -q "\[default\]"; then
+  pass "Unmatched repo uses default_account and labels it [default]"
+else
+  fail "Unmatched repo uses default_account" "$OUTPUT"
+fi
+
+# 6.6 …and does NOT print the old scary "not in account-guard config" warning
 if echo "$OUTPUT" | grep -q "not in account-guard"; then
-  pass "Unknown repo launch shows warning"
+  fail "No noisy warning for the default path" "still warns on every personal repo"
 else
-  fail "Unknown repo launch shows warning" "$OUTPUT"
+  pass "No noisy warning for the default path"
 fi
 
-# 6.5 Unknown repo defaults to default_account (= personal in test config)
-if echo "$OUTPUT" | grep -q "Defaulting to personal"; then
-  pass "Unknown repo defaults to default_account"
-else
-  fail "Unknown repo defaults to default_account" "$OUTPUT"
-fi
-
-# 6.6 Testcase match via python
-ACCT=$(python3 -c "
-import json, os
-cfg = json.load(open('$TMPDIR_BASE/.claude/account-guard.json'))
-cwd = '$TMPDIR_BASE/repos/testcases/hf-999'
-for rule in cfg.get('repo_rules', []):
-    if rule['match'] in cwd:
-        print(rule['account'])
-        exit(0)
-print('unknown')
-")
-if [ "$ACCT" = "testcase" ]; then
-  pass "testcases/ path → testcase account"
-else
-  fail "testcases/ path → testcase account" "got: $ACCT"
-fi
-
-# 6.7 Missing default_account + unknown repo → clean error
+# 6.7 Missing default_account + unmatched repo → clean error
 NODEFAULT_HOME="$TMPDIR_BASE/no-default"
 mkdir -p "$NODEFAULT_HOME/.claude"
 cat > "$NODEFAULT_HOME/.claude/account-guard.json" << 'JSON'
@@ -329,43 +335,83 @@ OUTPUT=$(
   PATH="$MOCK_BIN:$PATH" HOME="$NODEFAULT_HOME" \
   bash "$CCC" 2>&1 || true
 )
-if echo "$OUTPUT" | grep -q "no default_account set"; then
-  pass "Unknown repo + no default_account → helpful error"
+if echo "$OUTPUT" | grep -q "no default_account is set"; then
+  pass "Unmatched repo + no default_account → helpful error"
 else
-  fail "Unknown repo + no default_account → helpful error" "$OUTPUT"
+  fail "Unmatched repo + no default_account → helpful error" "$OUTPUT"
+fi
+
+# 6.8 A repo_rule pointing at an undefined account fails loudly
+BADACCT_HOME="$TMPDIR_BASE/bad-account"
+mkdir -p "$BADACCT_HOME/.claude" "$BADACCT_HOME/repos/anything"
+cat > "$BADACCT_HOME/.claude/account-guard.json" << 'JSON'
+{
+  "default_account": "personal",
+  "accounts": {
+    "personal": { "email": "a@b.c", "config_dir": "~/.claude-personal", "description": "p" }
+  },
+  "repo_rules": [ { "match": "anything", "account": "ghost" } ]
+}
+JSON
+OUTPUT=$(
+  cd "$BADACCT_HOME/repos/anything"
+  PATH="$MOCK_BIN:$PATH" HOME="$BADACCT_HOME" \
+  bash "$CCC" 2>&1 || true
+)
+if echo "$OUTPUT" | grep -q "unknown account"; then
+  pass "repo_rule with an undefined account → clear error"
+else
+  fail "repo_rule with an undefined account → clear error" "$OUTPUT"
 fi
 
 # ============================================================
-# Section 7: Testcase repo behavior
+# Section 7: Account mismatch + --force
 # ============================================================
 echo ""
-echo "--- Testcase repo path ---"
+echo "--- Account mismatch handling ---"
 
-# 7.1 With API key set → succeeds
-OUTPUT=$(
-  cd "$TMPDIR_BASE/repos/testcases/hf-999"
-  ANTHROPIC_API_KEY="sk-test-fake" \
-  PATH="$MOCK_BIN:$PATH" HOME="$TMPDIR_BASE" \
-  bash "$CCC" 2>&1 || true
-)
-if echo "$OUTPUT" | grep -q "testcase (direnv API key)"; then
-  pass "Testcase with API key shows success"
+# 7.1 Wrong logged-in email in a matched repo → refuse
+OUTPUT=$(CCC_TEST_AUTH_EMAIL="someone@else.com" run_ccc work-repo 2>&1 || true)
+if echo "$OUTPUT" | grep -q "ACCOUNT MISMATCH"; then
+  pass "Mismatched login refuses to launch"
 else
-  fail "Testcase with API key shows success" "$OUTPUT"
+  fail "Mismatched login refuses to launch" "$OUTPUT"
 fi
 
-# 7.2 Without API key → fails with helpful message
+# 7.2 --force overrides the mismatch and still launches
+ARGLOG_FORCE="$TMPDIR_BASE/arglog-force"
 OUTPUT=$(
-  cd "$TMPDIR_BASE/repos/testcases/hf-999"
-  unset ANTHROPIC_API_KEY 2>/dev/null || true
-  unset CLAUDE_API_KEY 2>/dev/null || true
+  cd "$TMPDIR_BASE/repos/work-repo"
+  CCC_TEST_ARGLOG="$ARGLOG_FORCE" \
+  CCC_TEST_AUTH_EMAIL="someone@else.com" \
+  PATH="$MOCK_BIN:$PATH" HOME="$TMPDIR_BASE" \
+  bash "$CCC" --force 2>&1 || true
+)
+if echo "$OUTPUT" | grep -q "launching anyway"; then
+  pass "--force overrides the mismatch"
+else
+  fail "--force overrides the mismatch" "$OUTPUT"
+fi
+
+# 7.3 --force is consumed by ccc and never reaches claude
+FORCE_ARGS=$(grep -v 'auth status' "$ARGLOG_FORCE" 2>/dev/null || echo "")
+if ! echo "$FORCE_ARGS" | grep -q -- '--force'; then
+  pass "--force is stripped before exec claude"
+else
+  fail "--force is stripped before exec claude" "args: $FORCE_ARGS"
+fi
+
+# 7.4 Not logged in at all → points at --setup
+OUTPUT=$(
+  cd "$TMPDIR_BASE/repos/work-repo"
+  CCC_TEST_LOGGED_OUT=1 \
   PATH="$MOCK_BIN:$PATH" HOME="$TMPDIR_BASE" \
   bash "$CCC" 2>&1 || true
 )
-if echo "$OUTPUT" | grep -q "no API key set"; then
-  pass "Testcase without API key shows error"
+if echo "$OUTPUT" | grep -q "Not logged into the work account"; then
+  pass "Logged-out account points at ccc --setup"
 else
-  fail "Testcase without API key shows error" "$OUTPUT"
+  fail "Logged-out account points at ccc --setup" "$OUTPUT"
 fi
 
 # ============================================================
@@ -379,6 +425,7 @@ mkdir -p "$NOGIT_BIN"
 cat > "$NOGIT_BIN/git" << 'MOCK'
 #!/bin/bash
 if [ "${1:-}" = "rev-parse" ]; then exit 128; fi
+if [ "${1:-}" = "remote" ]; then exit 1; fi
 /usr/bin/git "$@"
 MOCK
 chmod +x "$NOGIT_BIN/git"
@@ -393,6 +440,13 @@ if echo "$OUTPUT" | grep -q "Not in a git repo"; then
   pass "Non-git directory shows info message"
 else
   fail "Non-git directory shows info message" "$OUTPUT"
+fi
+
+# 8.2 A non-git directory still routes to the default account (not bare ~/.claude)
+if echo "$OUTPUT" | grep -q "→ personal"; then
+  pass "Non-git directory routes to default_account"
+else
+  fail "Non-git directory routes to default_account" "$OUTPUT"
 fi
 
 # ============================================================
@@ -418,8 +472,8 @@ ARGLOG_CHAN="$TMPDIR_BASE/arglog-channels"
   bash "$CCC" --telegram "/example:cmd" 2>&1 >/dev/null
 ) || true
 CLAUDE_ARGS=$(cat "$ARGLOG_CHAN" 2>/dev/null || echo "")
-if echo "$CLAUDE_ARGS" | grep -q -- '-- /example:cmd'; then
-  pass "--telegram + prompt separated by -- (no arg eating)"
+if echo "$CLAUDE_ARGS" | grep -q -- '--channels plugin:telegram@claude-plugins-official -- /example:cmd'; then
+  pass "--telegram + prompt separated by -- (channels can't eat the prompt)"
 else
   fail "--telegram + prompt separated by --" "args: $CLAUDE_ARGS"
 fi
@@ -478,9 +532,12 @@ c = json.load(open('$EXAMPLE'))
 assert 'accounts' in c, 'missing accounts'
 assert 'repo_rules' in c, 'missing repo_rules'
 for r in c['repo_rules']:
-    assert 'match' in r, f'rule missing match: {r}'
+    assert ('match' in r) != ('remote' in r), f'rule needs exactly one of match/remote: {r}'
     assert 'account' in r, f'rule missing account: {r}'
     assert r['account'] in c['accounts'], f'unknown account: {r[\"account\"]}'
+for name, a in c['accounts'].items():
+    assert a.get('email'), f'account {name} needs an email'
+    assert a.get('config_dir'), f'account {name} needs a config_dir'
 if 'default_account' in c:
     assert c['default_account'] in c['accounts'], 'default_account must reference a named account'
 " 2>/dev/null; then
@@ -490,6 +547,26 @@ if 'default_account' in c:
   fi
 else
   fail "account-guard.example.json exists" "not found at $EXAMPLE"
+fi
+
+# 10.2 The live config, if present, must satisfy the same schema
+LIVE="$HOME/.claude/account-guard.json"
+if [ -f "$LIVE" ]; then
+  if python3 -c "
+import json, os
+c = json.load(open(os.path.expanduser('$LIVE')))
+for r in c.get('repo_rules', []):
+    assert ('match' in r) != ('remote' in r), f'rule needs exactly one of match/remote: {r}'
+    assert r['account'] in c['accounts'], f'unknown account: {r[\"account\"]}'
+if 'default_account' in c:
+    assert c['default_account'] in c['accounts'], 'default_account must reference a named account'
+" 2>/dev/null; then
+    pass "Live ~/.claude/account-guard.json satisfies the schema"
+  else
+    fail "Live ~/.claude/account-guard.json satisfies the schema" "schema error"
+  fi
+else
+  pass "No live config to validate (skipped)"
 fi
 
 # ============================================================
@@ -531,14 +608,23 @@ else
   fail "Script exports GIT_CONFIG_GLOBAL" "not found in script"
 fi
 
-# 12.3 Running ccc in a known repo creates the per-account gh dir
+# 12.3 XDG_CONFIG_HOME is exported from the script for modern Wrangler
+if grep -q 'export XDG_CONFIG_HOME=' "$CCC"; then
+  pass "Script exports XDG_CONFIG_HOME"
+else
+  fail "Script exports XDG_CONFIG_HOME" "not found in script"
+fi
+
+# 12.4 Running ccc in a known repo creates the per-account gh dir
 ISOLATE_HOME="$TMPDIR_BASE/iso-home"
 mkdir -p "$ISOLATE_HOME/.claude" "$ISOLATE_HOME/.claude-personal" \
          "$ISOLATE_HOME/repos/my-project"
 cp "$TMPDIR_BASE/.claude/account-guard.json" "$ISOLATE_HOME/.claude/"
+ENVLOG="$TMPDIR_BASE/isolate-env"
 (
   cd "$ISOLATE_HOME/repos/my-project"
   CCC_TEST_ARGLOG="/dev/null" \
+  CCC_TEST_ENVLOG="$ENVLOG" \
   CCC_TEST_AUTH_EMAIL="test@personal.com" \
   PATH="$MOCK_BIN:$PATH" HOME="$ISOLATE_HOME" \
   bash "$CCC" 2>&1 >/dev/null
@@ -549,7 +635,18 @@ else
   fail "Per-account gh dir created" "$ISOLATE_HOME/.claude-personal/gh missing"
 fi
 
-# 12.4 Running ccc creates the per-account gitconfig with the include stanza
+# 12.5 Running ccc exports per-account auth env vars
+if grep -q "^GH_CONFIG_DIR=$ISOLATE_HOME/.claude-personal/gh$" "$ENVLOG" \
+  && grep -q "^GIT_CONFIG_GLOBAL=$ISOLATE_HOME/.claude-personal/gitconfig$" "$ENVLOG" \
+  && grep -q "^WRANGLER_HOME=$ISOLATE_HOME/.claude-personal/wrangler$" "$ENVLOG" \
+  && grep -q "^XDG_CONFIG_HOME=$ISOLATE_HOME/.claude-personal/xdg$" "$ENVLOG"; then
+  pass "Per-account env vars exported to claude session"
+else
+  fail "Per-account env vars exported to claude session" \
+    "env: $(cat "$ENVLOG" 2>/dev/null)"
+fi
+
+# 12.6 Running ccc creates the per-account gitconfig with the include stanza
 if [ -f "$ISOLATE_HOME/.claude-personal/gitconfig" ]; then
   pass "Per-account gitconfig file created"
   if grep -q 'path = ~/.gitconfig' "$ISOLATE_HOME/.claude-personal/gitconfig"; then
@@ -562,7 +659,16 @@ else
   fail "Per-account gitconfig file created" "missing"
 fi
 
-# 12.5 Existing per-account gitconfig is NOT clobbered
+# 12.7 Per-account gitconfig clears shared helpers and forces gh for GitHub HTTPS
+if grep -q '\[credential "https://github.com"\]' "$ISOLATE_HOME/.claude-personal/gitconfig" \
+  && grep -q 'helper = !gh auth git-credential' "$ISOLATE_HOME/.claude-personal/gitconfig"; then
+  pass "Per-account gitconfig forces gh credential helper for GitHub hosts"
+else
+  fail "Per-account gitconfig forces gh credential helper" \
+    "content: $(cat "$ISOLATE_HOME/.claude-personal/gitconfig")"
+fi
+
+# 12.8 Existing per-account gitconfig is NOT clobbered
 USER_CONTENT="# user-edited content"
 echo "$USER_CONTENT" > "$ISOLATE_HOME/.claude-personal/gitconfig"
 (
