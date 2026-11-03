@@ -1,52 +1,37 @@
 #!/bin/bash
 # ccc — Claude Code launcher with multi-account support
 #
-# Uses CLAUDE_CONFIG_DIR to run separate accounts simultaneously.
-# Each account has its own config dir with independent auth tokens.
+# Uses CLAUDE_CONFIG_DIR to run separate accounts side by side. Each account
+# gets its own config dir, and with it its own Claude auth token, `gh` token,
+# git identity and Wrangler/Cloudflare state.
 #
 # Usage:
-#   ccc                Launch Claude Code (1M context · Opus 4.7 · compacts at 500K)
-#   ccc --telegram     Launch with Telegram channel enabled
-#   ccc --force        Override account mismatch
-#   ccc --status       Show current account mapping for this repo
-#   ccc --setup        Interactive setup: login to each account from your config
-#   ccc --resume       Resume last session (passed through to claude)
-#   ccc [any args]     Passed through to claude
+#   ccc                Launch Claude Code on the account this repo maps to
+#   ccc --telegram     Also enable the Telegram channel
+#   ccc --force        Launch even if the logged-in email doesn't match
+#   ccc --status       Show the account mapping for this repo
+#   ccc --setup        Interactive login for every account in the config
+#   ccc --doctor       Check config, every login, and that ccc itself is pushed
+#   ccc [any args]     Passed through to claude (--resume, -c, a prompt, …)
 #
 # Config: ~/.claude/account-guard.json
-#   - "accounts": named accounts with email + config_dir + description
-#   - "repo_rules": ordered list of substring matches against cwd → account name
-#   - "default_account" (optional): used when no rule matches
+#   accounts         name → { email, config_dir, description }
+#   repo_rules       ordered list; each rule is { account } plus ONE of:
+#                      "remote" — substring of the origin remote URL (case-insensitive)
+#                      "match"  — substring of the full cwd path
+#                    The first rule that matches wins.
+#   default_account  used when no rule matches. Omit it to fail loudly instead.
 #
-# DEPRECATED flags (silently accepted for muscle memory, no-op):
-#   --orch / --orchestrator   (routine and orchestrator modes were merged)
+# The model is deliberately NOT set here. It belongs in each account's
+# <config_dir>/settings.json (e.g. "model": "opus[1m]"), because a --model
+# flag on the command line overrides that file — and passing a bare alias
+# like `--model opus` silently drops the 1M context variant.
 
 set -euo pipefail
 
 GUARD_CONFIG="$HOME/.claude/account-guard.json"
 EXTRA_FLAGS=()
-
-# --- Handle flags (must be before other arg parsing) ---
-ARGS=()
-for arg in "$@"; do
-  if [ "$arg" = "--telegram" ]; then
-    EXTRA_FLAGS+=(--channels plugin:telegram@claude-plugins-official)
-  elif [ "$arg" = "--orch" ] || [ "$arg" = "--orchestrator" ]; then
-    : # DEPRECATED — routine and orchestrator modes were merged; both always 1M Opus
-  else
-    ARGS+=("$arg")
-  fi
-done
-set -- "${ARGS[@]+"${ARGS[@]}"}"
-
-# --- Decide whether to use `--` before user args ---
-# Add `--` ONLY when the user is passing a positional prompt (e.g. `ccc /your:command`),
-# so `--channels` from EXTRA_FLAGS can't eat it. SKIP `--` when the user is passing flags
-# like `--resume`, `--continue`, `-c` — otherwise claude treats them as the prompt.
-SEPARATOR=()
-if [ "$#" -gt 0 ] && [[ "${1}" != -* ]]; then
-  SEPARATOR=(--)
-fi
+FORCE=0
 
 # Colors
 RED='\033[0;31m'
@@ -55,202 +40,49 @@ GOLD='\033[0;33m'
 DIM='\033[0;90m'
 NC='\033[0m'
 
-# --- Session config: always 1M context · Opus 4.7 · compact at 500K ---
-EXTRA_FLAGS+=(--model opus)
-export CLAUDE_CODE_AUTO_COMPACT_WINDOW=500000
-echo -e "${GOLD}⚡ 1M context · Opus 4.7${NC} · compacts at 500K"
+# Resolve the real script dir (ccc is usually reached through a symlink in
+# ~/.local/bin) so the helpers in lib/ are found.
+CCC_LIB="$(dirname "$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "${BASH_SOURCE[0]}")")/lib"
 
-# --- Config existence check ---
-if [ ! -f "$GUARD_CONFIG" ]; then
-  echo -e "${RED}✗${NC} No account-guard config at $GUARD_CONFIG"
-  echo "  Copy account-guard.example.json from the ccc-launcher repo and fill in"
-  echo "  your email(s) and repo folder rules, then re-run."
+# Never exit silently: if any command fails unexpectedly, say where.
+set -E
+trap 'echo -e "${RED}✗ ccc stopped unexpectedly (line $LINENO): $BASH_COMMAND${NC}" >&2; echo "  Run: ccc --doctor" >&2' ERR
+
+if ! command -v claude >/dev/null 2>&1; then
+  echo -e "${RED}✗${NC} The 'claude' command is not on PATH. Install Claude Code first."
   exit 1
 fi
 
-# --- Setup mode ---
-if [ "${1:-}" = "--setup" ]; then
-  echo -e "${GOLD}Claude Code Multi-Account Setup${NC}"
-  echo ""
-  echo "This will log you into each account in its own config dir."
-  echo "You only need to do this once per account."
-  echo ""
+# --- Handle ccc's own flags; everything else is passed through to claude ---
+ARGS=()
+for arg in "$@"; do
+  case "$arg" in
+    --telegram) EXTRA_FLAGS+=(--channels plugin:telegram@claude-plugins-official) ;;
+    --force)    FORCE=1 ;;
+    *)          ARGS+=("$arg") ;;
+  esac
+done
+set -- "${ARGS[@]+"${ARGS[@]}"}"
 
-  # Pull accounts from the guard config. Skip any account with null email
-  # (e.g. a 'testcase' account that uses direnv API key instead of OAuth).
-  python3 -c "
-import json, os
-cfg = json.load(open(os.path.expanduser('$GUARD_CONFIG')))
-for name, acct in cfg.get('accounts', {}).items():
-    email = acct.get('email')
-    cd = acct.get('config_dir') or ''
-    if not email or not cd:
-        continue
-    cd = cd.replace('~', os.path.expanduser('~'))
-    print(f'{name}|{email}|{cd}')
-" | while IFS='|' read -r name email cd; do
-    echo -e "${GOLD}→ $name ($email)${NC}"
-    echo "    Config dir: $cd"
-    read -p "    Claude: press Enter to login (or 's' to skip): " choice
-    if [ "$choice" != "s" ]; then
-      CLAUDE_CONFIG_DIR="$cd" claude auth login --email "$email" || true
-    fi
-
-    if command -v gh >/dev/null 2>&1; then
-      read -p "    GitHub: press Enter to also run 'gh auth login' (or 's' to skip): " ghchoice
-      if [ "$ghchoice" != "s" ]; then
-        mkdir -p "$cd/gh"
-        GH_CONFIG_DIR="$cd/gh" gh auth login || true
-        GH_CONFIG_DIR="$cd/gh" gh auth setup-git || true
-      fi
-    else
-      echo "    (gh CLI not installed — skipping GitHub login. Install: brew install gh)"
-    fi
-    echo ""
-  done
-
-  echo -e "${GREEN}Setup complete!${NC} Use 'ccc' to launch Claude Code."
-  echo "Each tmux pane can run a different account simultaneously."
-  exit 0
+# --- Decide whether to use `--` before user args ---
+# Add `--` ONLY when the user is passing a positional prompt (e.g. `ccc /your:command`),
+# so the variadic `--channels` from EXTRA_FLAGS can't swallow it. SKIP `--` when the
+# user is passing flags like `--resume`, `--continue`, `-c` — otherwise claude treats
+# them as the prompt.
+SEPARATOR=()
+if [ "$#" -gt 0 ] && [[ "${1}" != -* ]]; then
+  SEPARATOR=(--)
 fi
 
-# --- Detect repo ---
-REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || echo "")
-REPO_NAME=$(basename "$REPO_ROOT" 2>/dev/null || basename "$(pwd)")
+ensure_account_gitconfig() {
+  local config_dir="$1"
+  local gitconfig="$config_dir/gitconfig"
 
-if [ -z "$REPO_ROOT" ]; then
-  echo -e "${DIM}Not in a git repo — using default config.${NC}"
-  exec claude --dangerously-skip-permissions ${EXTRA_FLAGS[@]+"${EXTRA_FLAGS[@]}"} ${SEPARATOR[@]+"${SEPARATOR[@]}"} "$@"
-fi
-
-# --- Look up account for this repo ---
-# Matches against full cwd path so testcases/ subdirs match before the parent repo
-CWD="$(pwd)"
-ACCOUNT_INFO=$(python3 -c "
-import json, sys, os
-cfg = json.load(open(os.path.expanduser('$GUARD_CONFIG')))
-cwd = '$CWD'
-# Match against full path — order in config matters, testcase rules checked first
-for rule in cfg.get('repo_rules', []):
-    if rule['match'] in cwd:
-        acct = cfg['accounts'][rule['account']]
-        config_dir = (acct.get('config_dir') or '').replace('~', os.path.expanduser('~'))
-        print(f\"{rule['account']}|{acct.get('email', '')}|{config_dir}|{acct.get('description', '')}\")
-        sys.exit(0)
-print('unknown|||')
-" 2>/dev/null)
-
-ACCT_TYPE=$(echo "$ACCOUNT_INFO" | cut -d'|' -f1)
-ACCT_EMAIL=$(echo "$ACCOUNT_INFO" | cut -d'|' -f2)
-ACCT_CONFIG_DIR=$(echo "$ACCOUNT_INFO" | cut -d'|' -f3)
-ACCT_DESC=$(echo "$ACCOUNT_INFO" | cut -d'|' -f4)
-
-# --- Status mode ---
-if [ "${1:-}" = "--status" ]; then
-  echo -e "${GOLD}Repo:${NC}    $REPO_NAME"
-  echo -e "${GOLD}Account:${NC} $ACCT_TYPE ($ACCT_EMAIL)"
-  echo -e "${GOLD}Config:${NC}  $ACCT_CONFIG_DIR"
-  echo -e "${GOLD}Desc:${NC}    $ACCT_DESC"
-  if [ -n "$ACCT_CONFIG_DIR" ]; then
-    CLAUDE_CONFIG_DIR="$ACCT_CONFIG_DIR" claude auth status 2>/dev/null || echo "Not logged in yet — run: ccc --setup"
-  fi
-  exit 0
-fi
-
-# --- Testcase repos: direnv handles it ---
-if [ "$ACCT_TYPE" = "testcase" ]; then
-  API_KEY="${ANTHROPIC_API_KEY:-${CLAUDE_API_KEY:-}}"
-  if [ -n "$API_KEY" ]; then
-    export ANTHROPIC_API_KEY="$API_KEY"
-    echo -e "${GREEN}✓${NC} $REPO_NAME → testcase (direnv API key)"
-    exec claude --dangerously-skip-permissions ${EXTRA_FLAGS[@]+"${EXTRA_FLAGS[@]}"} ${SEPARATOR[@]+"${SEPARATOR[@]}"} "$@"
-  else
-    echo -e "${RED}✗${NC} Testcase repo but no API key set."
-    echo "  Make sure direnv is loaded: direnv allow"
-    echo "  Expected: ANTHROPIC_API_KEY or CLAUDE_API_KEY in .envrc"
-    exit 1
-  fi
-fi
-
-# --- Unknown repo → fall back to default_account from config ---
-if [ "$ACCT_TYPE" = "unknown" ]; then
-  DEFAULT_INFO=$(python3 -c "
-import json, os
-cfg = json.load(open(os.path.expanduser('$GUARD_CONFIG')))
-name = cfg.get('default_account')
-if not name or name not in cfg.get('accounts', {}):
-    print('|||')
-else:
-    a = cfg['accounts'][name]
-    cd = (a.get('config_dir') or '').replace('~', os.path.expanduser('~'))
-    print(f\"{name}|{a.get('email','')}|{cd}|{a.get('description','')}\")
-" 2>/dev/null)
-
-  D_TYPE=$(echo "$DEFAULT_INFO" | cut -d'|' -f1)
-  if [ -z "$D_TYPE" ]; then
-    echo -e "${RED}✗${NC} Repo '${REPO_NAME}' not in account-guard config, and no default_account set."
-    echo "  Add a repo_rule to $GUARD_CONFIG, or set 'default_account' to a named account."
-    exit 1
+  if [ -f "$gitconfig" ]; then
+    return
   fi
 
-  echo -e "${GOLD}⚠${NC} Repo '${REPO_NAME}' not in account-guard config."
-  echo "  Defaulting to ${D_TYPE} account..."
-  ACCT_TYPE="$D_TYPE"
-  ACCT_EMAIL=$(echo "$DEFAULT_INFO" | cut -d'|' -f2)
-  ACCT_CONFIG_DIR=$(echo "$DEFAULT_INFO" | cut -d'|' -f3)
-  ACCT_DESC=$(echo "$DEFAULT_INFO" | cut -d'|' -f4)
-fi
-
-# --- Check if logged in to the right account ---
-if [ -n "$ACCT_CONFIG_DIR" ]; then
-  CURRENT_EMAIL=$(CLAUDE_CONFIG_DIR="$ACCT_CONFIG_DIR" claude auth status --json 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('email',''))" 2>/dev/null || echo "")
-
-  if [ -z "$CURRENT_EMAIL" ]; then
-    echo -e "${RED}✗${NC} Not logged into $ACCT_TYPE account yet."
-    echo "  Run: ccc --setup"
-    echo "  Or:  CLAUDE_CONFIG_DIR=$ACCT_CONFIG_DIR claude auth login --email $ACCT_EMAIL"
-    exit 1
-  fi
-
-  if [ -n "$ACCT_EMAIL" ] && [ "$CURRENT_EMAIL" != "$ACCT_EMAIL" ]; then
-    echo -e "${RED}🚫 ACCOUNT MISMATCH${NC}"
-    echo "  Repo:     $REPO_NAME → needs $ACCT_TYPE"
-    echo "  Expected: $ACCT_EMAIL"
-    echo "  Got:      $CURRENT_EMAIL"
-    echo ""
-    echo "  Fix: CLAUDE_CONFIG_DIR=$ACCT_CONFIG_DIR claude auth login --email $ACCT_EMAIL"
-    if [ "${1:-}" = "--force" ]; then
-      shift
-    else
-      exit 1
-    fi
-  fi
-
-  echo -e "${GREEN}✓${NC} $REPO_NAME → $ACCT_TYPE ($CURRENT_EMAIL)"
-  export CLAUDE_CONFIG_DIR="$ACCT_CONFIG_DIR"
-
-  # --- Per-account Wrangler config dir (for `wrangler login` OAuth credentials) ---
-  # Each account stores its OAuth token in its own dir, so they don't overwrite each other.
-  mkdir -p "$ACCT_CONFIG_DIR/wrangler"
-  export WRANGLER_HOME="$ACCT_CONFIG_DIR/wrangler"
-
-  # --- Per-account GitHub CLI config dir ---
-  # `gh` honors GH_CONFIG_DIR the same way `claude` honors CLAUDE_CONFIG_DIR.
-  # Each account stores its own auth token + host config under its dir.
-  # Pair with `gh auth setup-git` once per account so git push over HTTPS picks
-  # up the right token automatically.
-  mkdir -p "$ACCT_CONFIG_DIR/gh"
-  export GH_CONFIG_DIR="$ACCT_CONFIG_DIR/gh"
-
-  # --- Per-account git config (user.email, signing key, credential helper) ---
-  # Without this, `git config --global` is shared across accounts and your
-  # commits get signed by the wrong identity. The per-account file includes
-  # the user's normal ~/.gitconfig as a base so aliases + global prefs still
-  # apply; users add per-account overrides (user.email, core.sshCommand for
-  # account-specific SSH keys, etc.) below the include stanza.
-  GITCONFIG="$ACCT_CONFIG_DIR/gitconfig"
-  if [ ! -f "$GITCONFIG" ]; then
-    cat > "$GITCONFIG" << 'GITCFG'
+  cat > "$gitconfig" << 'GITCFG'
 # Auto-created by ccc launcher. Add per-account overrides below the include.
 # Common examples:
 #   [user]
@@ -260,29 +92,184 @@ if [ -n "$ACCT_CONFIG_DIR" ]; then
 #       sshCommand = ssh -i ~/.ssh/work_ed25519
 [include]
     path = ~/.gitconfig
+
+# Force GitHub HTTPS auth through `gh` under GH_CONFIG_DIR.
+# The empty helper clears shared helpers from ~/.gitconfig such as osxkeychain.
+[credential "https://github.com"]
+    helper =
+    helper = !gh auth git-credential
+[credential "https://gist.github.com"]
+    helper =
+    helper = !gh auth git-credential
 GITCFG
-  fi
-  export GIT_CONFIG_GLOBAL="$GITCONFIG"
+}
 
-  # --- Source per-account Cloudflare env if present ---
-  # File format (one var per line):
-  #   CLOUDFLARE_API_TOKEN=...        ← optional; if set, overrides OAuth
-  #   CLOUDFLARE_ACCOUNT_ID=...       ← recommended; used by wrangler when account is ambiguous
-  # If CLOUDFLARE_API_TOKEN is empty/missing, wrangler falls back to OAuth via WRANGLER_HOME.
-  if [ -f "$ACCT_CONFIG_DIR/cloudflare.env" ]; then
-    set -a
-    # shellcheck source=/dev/null
-    source "$ACCT_CONFIG_DIR/cloudflare.env"
-    set +a
-    if [ -n "${CLOUDFLARE_API_TOKEN:-}" ]; then
-      echo -e "${GREEN}✓${NC} Cloudflare API token loaded for $ACCT_TYPE"
-    else
-      echo -e "${GREEN}✓${NC} Cloudflare account-id loaded for $ACCT_TYPE (OAuth via WRANGLER_HOME)"
-    fi
-  fi
-
-  exec claude --dangerously-skip-permissions ${EXTRA_FLAGS[@]+"${EXTRA_FLAGS[@]}"} ${SEPARATOR[@]+"${SEPARATOR[@]}"} "$@"
+# --- Config existence check ---
+if [ ! -f "$GUARD_CONFIG" ]; then
+  echo -e "${RED}✗${NC} No account-guard config at $GUARD_CONFIG"
+  echo "  Copy account-guard.example.json from the ccc-launcher repo and fill in"
+  echo "  your email(s) and repo rules, then re-run."
+  exit 1
 fi
 
-# Fallback
+# --- Setup / doctor modes ---
+if [ "${1:-}" = "--setup" ]; then
+  # shellcheck source=lib/setup.sh
+  source "$CCC_LIB/setup.sh"
+fi
+if [ "${1:-}" = "--doctor" ]; then
+  # shellcheck source=lib/doctor.sh
+  source "$CCC_LIB/doctor.sh"
+fi
+
+# --- Detect repo ---
+REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || echo "")
+CWD="$(pwd)"
+if [ -n "$REPO_ROOT" ]; then
+  REPO_NAME=$(basename "$REPO_ROOT")
+  REPO_REMOTE=$(git remote get-url origin 2>/dev/null || echo "")
+else
+  REPO_NAME=$(basename "$CWD")
+  REPO_REMOTE=""
+  echo -e "${DIM}Not in a git repo — routing on path only.${NC}"
+fi
+
+# --- Look up the account for this repo ---
+# Rules are matched against the origin remote URL and the full cwd path, so a
+# git worktree resolves to the same account as its parent repo even when the
+# directory is named something else.
+ACCOUNT_INFO=$(
+  CCC_GUARD="$GUARD_CONFIG" CCC_CWD="$CWD" CCC_REMOTE="$REPO_REMOTE" python3 "$CCC_LIB/route.py"
+) || {
+  echo -e "${RED}✗${NC} Could not read $GUARD_CONFIG (see error above)."
+  exit 1
+}
+
+ACCT_SOURCE=$(echo "$ACCOUNT_INFO" | cut -d'|' -f1)
+ACCT_TYPE=$(echo "$ACCOUNT_INFO" | cut -d'|' -f2)
+ACCT_EMAIL=$(echo "$ACCOUNT_INFO" | cut -d'|' -f3)
+ACCT_CONFIG_DIR=$(echo "$ACCOUNT_INFO" | cut -d'|' -f4)
+ACCT_DESC=$(echo "$ACCOUNT_INFO" | cut -d'|' -f5-)
+
+# --- Status mode ---
+if [ "${1:-}" = "--status" ]; then
+  echo -e "${GOLD}Repo:${NC}    $REPO_NAME"
+  echo -e "${GOLD}Remote:${NC}  ${REPO_REMOTE:-(none)}"
+  if [ "$ACCT_SOURCE" = "none" ]; then
+    echo -e "${GOLD}Account:${NC} unknown — no matching rule and no default_account"
+    exit 1
+  fi
+  echo -e "${GOLD}Account:${NC} $ACCT_TYPE ($ACCT_EMAIL) via $ACCT_SOURCE"
+  echo -e "${GOLD}Config:${NC}  $ACCT_CONFIG_DIR"
+  echo -e "${GOLD}Desc:${NC}    $ACCT_DESC"
+  if [ -n "$ACCT_CONFIG_DIR" ]; then
+    STATUS_EMAIL=$(python3 "$CCC_LIB/auth_email.py" "$ACCT_CONFIG_DIR" 2>/dev/null || true)
+    if [ -n "$STATUS_EMAIL" ]; then
+      echo -e "${GOLD}Login:${NC}   $STATUS_EMAIL"
+    else
+      echo -e "${GOLD}Login:${NC}   ${RED}not logged in${NC} — run: ccc --setup"
+    fi
+  fi
+  exit 0
+fi
+
+# --- No rule matched and no default configured → refuse rather than guess ---
+if [ "$ACCT_SOURCE" = "none" ]; then
+  echo -e "${RED}✗${NC} Repo '${REPO_NAME}' matches no repo_rule, and no default_account is set."
+  echo "  Add a repo_rule to $GUARD_CONFIG, or set 'default_account' to a named account."
+  exit 1
+fi
+
+if [ -z "$ACCT_CONFIG_DIR" ]; then
+  echo -e "${RED}✗${NC} Account '$ACCT_TYPE' has no config_dir in $GUARD_CONFIG."
+  exit 1
+fi
+
+# --- Check we're logged into the right account ---
+AUTH_RC=0
+CURRENT_EMAIL=$(python3 "$CCC_LIB/auth_email.py" "$ACCT_CONFIG_DIR") || AUTH_RC=$?
+
+if [ "$AUTH_RC" -eq 3 ]; then
+  echo -e "${RED}✗${NC} Could not read the login state of the $ACCT_TYPE account (see above)."
+  echo "  Try: CLAUDE_CONFIG_DIR=$ACCT_CONFIG_DIR claude auth status"
+  exit 1
+fi
+
+if [ -z "$CURRENT_EMAIL" ]; then
+  echo -e "${RED}✗${NC} Not logged into the $ACCT_TYPE account yet."
+  echo "  Run: ccc --setup"
+  echo "  Or:  CLAUDE_CONFIG_DIR=$ACCT_CONFIG_DIR claude auth login --email $ACCT_EMAIL"
+  exit 1
+fi
+
+if [ -n "$ACCT_EMAIL" ] && [ "$CURRENT_EMAIL" != "$ACCT_EMAIL" ]; then
+  echo -e "${RED}🚫 ACCOUNT MISMATCH${NC}"
+  echo "  Repo:     $REPO_NAME → needs $ACCT_TYPE"
+  echo "  Expected: $ACCT_EMAIL"
+  echo "  Got:      $CURRENT_EMAIL"
+  echo ""
+  echo "  Fix: CLAUDE_CONFIG_DIR=$ACCT_CONFIG_DIR claude auth login --email $ACCT_EMAIL"
+  if [ "$FORCE" -ne 1 ]; then
+    echo "  Or re-run with --force to launch anyway."
+    exit 1
+  fi
+  echo -e "  ${GOLD}--force given — launching anyway.${NC}"
+fi
+
+if [ "$ACCT_SOURCE" = "default" ]; then
+  echo -e "${GREEN}✓${NC} $REPO_NAME → $ACCT_TYPE ($CURRENT_EMAIL) ${DIM}[default]${NC}"
+else
+  echo -e "${GREEN}✓${NC} $REPO_NAME → $ACCT_TYPE ($CURRENT_EMAIL)"
+fi
+export CLAUDE_CONFIG_DIR="$ACCT_CONFIG_DIR"
+
+# --- Per-account Wrangler config dir (for `wrangler login` OAuth credentials) ---
+# Wrangler v4 stores auth in XDG config on macOS (~/Library/Preferences/.wrangler
+# by default) and ignores WRANGLER_HOME. Point XDG_CONFIG_HOME at an account-scoped
+# directory so `wrangler login` writes separate OAuth state per account.
+# Keep WRANGLER_HOME for older Wrangler v1-style tooling that may still honor it.
+mkdir -p "$ACCT_CONFIG_DIR/wrangler"
+mkdir -p "$ACCT_CONFIG_DIR/xdg"
+export WRANGLER_HOME="$ACCT_CONFIG_DIR/wrangler"
+export XDG_CONFIG_HOME="$ACCT_CONFIG_DIR/xdg"
+if [ -d "$HOME/.wrangler" ]; then
+  echo -e "${GOLD}⚠${NC} Legacy ~/.wrangler exists; modern Wrangler prefers it over XDG_CONFIG_HOME."
+  echo "  Move ~/.wrangler aside or use $ACCT_CONFIG_DIR/cloudflare.env with CLOUDFLARE_API_TOKEN for clean isolation."
+fi
+
+# --- Per-account GitHub CLI config dir ---
+# `gh` honors GH_CONFIG_DIR the same way `claude` honors CLAUDE_CONFIG_DIR.
+# Each account stores its own auth token + host config under its dir.
+# Pair with the per-account gitconfig below so HTTPS push uses GH_CONFIG_DIR
+# instead of a shared helper such as osxkeychain.
+mkdir -p "$ACCT_CONFIG_DIR/gh"
+export GH_CONFIG_DIR="$ACCT_CONFIG_DIR/gh"
+
+# --- Per-account git config (user.email, signing key, credential helper) ---
+# Without this, `git config --global` is shared across accounts and your
+# commits get signed by the wrong identity. The per-account file includes
+# the user's normal ~/.gitconfig as a base so aliases + global prefs still
+# apply; users add per-account overrides (user.email, core.sshCommand for
+# account-specific SSH keys, etc.) below the include stanza.
+GITCONFIG="$ACCT_CONFIG_DIR/gitconfig"
+ensure_account_gitconfig "$ACCT_CONFIG_DIR"
+export GIT_CONFIG_GLOBAL="$GITCONFIG"
+
+# --- Source per-account Cloudflare env if present ---
+# File format (one var per line):
+#   CLOUDFLARE_API_TOKEN=...        ← optional; if set, overrides OAuth
+#   CLOUDFLARE_ACCOUNT_ID=...       ← recommended; used by wrangler when account is ambiguous
+# If CLOUDFLARE_API_TOKEN is empty/missing, wrangler falls back to OAuth via XDG_CONFIG_HOME.
+if [ -f "$ACCT_CONFIG_DIR/cloudflare.env" ]; then
+  set -a
+  # shellcheck source=/dev/null
+  source "$ACCT_CONFIG_DIR/cloudflare.env"
+  set +a
+  if [ -n "${CLOUDFLARE_API_TOKEN:-}" ]; then
+    echo -e "${GREEN}✓${NC} Cloudflare API token loaded for $ACCT_TYPE"
+  else
+    echo -e "${GREEN}✓${NC} Cloudflare account-id loaded for $ACCT_TYPE (OAuth via XDG_CONFIG_HOME)"
+  fi
+fi
+
 exec claude --dangerously-skip-permissions ${EXTRA_FLAGS[@]+"${EXTRA_FLAGS[@]}"} ${SEPARATOR[@]+"${SEPARATOR[@]}"} "$@"

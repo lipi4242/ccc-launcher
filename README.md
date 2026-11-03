@@ -5,13 +5,17 @@ A small bash wrapper around `claude` that:
 - **Runs multiple Claude accounts side-by-side.** Each account has its own
   config dir, so you can have separate tmux panes signed into different
   accounts without re-logging in.
-- **Routes each repo to the right account.** Match a substring of the cwd
-  to an account name; everything unmatched falls through to your
-  `default_account` (typically `personal`).
-- **Always launches with `--dangerously-skip-permissions`,** 1M context,
-  Opus 4.7, with compaction at 500K tokens.
+- **Routes each repo to the right account.** Match on the repo's origin
+  remote or on a substring of the cwd; everything unmatched falls through
+  to your `default_account` (typically `personal`).
+- **Always launches with `--dangerously-skip-permissions`.**
 - **Refuses to launch on an account mismatch** (e.g. you're sitting in a
   work repo but logged into your personal account). Override with `--force`.
+
+It deliberately does **not** set the model, context size or compaction
+window — those belong in each account's `<config_dir>/settings.json`. A
+`--model` flag on the command line overrides that file, and passing a bare
+alias like `--model opus` silently drops the `opus[1m]` 1M-context variant.
 
 The launcher itself never sees your tokens — it just sets `CLAUDE_CONFIG_DIR`
 before invoking `claude`. Auth still happens via `claude auth login` per
@@ -60,24 +64,46 @@ each entry keeps its own auth token.
 Add as many as you need. The names are arbitrary identifiers — pick
 whatever helps you read the `--status` output.
 
-The optional `testcase` account (with `email: null`, `config_dir: null`)
-is a special path: it doesn't OAuth, it picks up `ANTHROPIC_API_KEY` /
-`CLAUDE_API_KEY` from your environment (e.g. via direnv). Delete it if
-you don't use API-key workflows.
-
 ### `repo_rules`
 
-An ordered list. Each rule is `{match, account}`. `match` is a substring
-checked against the **full cwd path**. The first matching rule wins —
-which means more specific rules should appear above more general ones.
+An ordered list. Each rule names an `account` plus **exactly one** matcher:
+
+| Key | Matched against | Notes |
+|-----|-----------------|-------|
+| `remote` | the repo's `origin` remote URL | case-insensitive substring |
+| `match`  | the full cwd path | case-sensitive substring |
+
+The first matching rule wins, so put more specific rules above more
+general ones.
 
 ```json
 "repo_rules": [
-  { "match": "testcases/", "account": "testcase" },
-  { "match": "acme-internal", "account": "acme" },
-  { "match": "client-projects/acme/", "account": "acme" }
+  { "remote": "github.com/acme-org/", "account": "acme" },
+  { "remote": "gitlab.com/acme/",     "account": "acme" },
+  { "match":  "/acme-",               "account": "acme" }
 ]
 ```
+
+**Prefer `remote` rules.** A GitHub org is the boundary you actually mean,
+and it survives things a path rule doesn't:
+
+- **Git worktrees.** `~/code/acme-hotfix` and `~/code/wt-recon` both resolve
+  to their parent repo's remote, so they route correctly no matter what you
+  named the directory.
+- **Near-miss directory names.** A path rule for `acme` also catches
+  `acme-labs`, which may be an entirely unrelated project. An org rule
+  doesn't.
+
+`remote` matching normalises `:` to `/` before comparing, so a single rule
+written as `github.com/acme-org/` matches both remote forms:
+
+```
+https://github.com/acme-org/thing.git
+git@github.com:acme-org/thing.git
+```
+
+Use `match` for repos that have no remote yet, or when the account boundary
+genuinely is a directory rather than an org.
 
 ### `default_account`
 
@@ -93,15 +119,22 @@ If you omit `default_account`, the launcher refuses to start in an
 unmatched repo and tells you to add a rule. Use that if you'd rather
 fail loudly than silently route to the wrong account.
 
+The default path is quiet but never invisible: every launch prints the
+account it picked, and marks the fallback explicitly.
+
+```
+✓ my-notes → personal (you@personal.example) [default]
+✓ acme-app → work (you@work.example)
+```
+
 ## First-time login
 
 ```bash
 ccc --setup
 ```
 
-Walks through each account in your config (skipping the `testcase`-style
-ones automatically) and runs `claude auth login` against the right
-config dir. Each account needs this once.
+Walks through each account in your config and runs `claude auth login`
+against the right config dir. Each account needs this once.
 
 ## Daily use
 
@@ -109,6 +142,7 @@ config dir. Each account needs this once.
 cd ~/code/some-repo
 ccc                       # picks the right account, launches claude
 ccc --status              # show which account this repo maps to
+ccc --doctor              # check logins, config and that the launcher is pushed
 ccc --resume <session>    # pass through to claude
 ccc /your:slash-command   # passes a slash command as the prompt
 ccc --telegram            # adds the Telegram channel plugin
